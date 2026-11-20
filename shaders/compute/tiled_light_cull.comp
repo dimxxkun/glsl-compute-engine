@@ -1,0 +1,161 @@
+#version 460 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+const uint TILE_SIZE = 16u;
+const uint WORKGROUP_THREADS = TILE_SIZE * TILE_SIZE;
+const uint MAX_LIGHTS_PER_TILE = 256u;
+
+struct PointLight {
+    vec4 positionRadius;  // xyz = world position, w = influence radius
+    vec4 colorIntensity;  // rgb = linear color, w = luminous intensity
+};
+
+layout(std140, binding = 0) uniform TileCullUBO {
+    mat4  viewMatrix;
+    mat4  invProjectionMatrix;
+    uvec4 screenAndTiles;  // x = screenWidth, y = screenHeight, z = tileCountX, w = tileCountY
+    uvec4 lightParams;     // x = lightCount, y = maxLightsPerTile (<= MAX_LIGHTS_PER_TILE), z = 0, w = 0
+} uCull;
+
+layout(binding = 0) uniform sampler2D uDepthTexture;
+
+layout(std430, binding = 0) readonly buffer PointLightBuffer {
+    PointLight lights[];
+};
+
+layout(std430, binding = 1) writeonly buffer TileLightIndexBuffer {
+    uint tileLightIndices[];
+};
+
+layout(std430, binding = 2) writeonly buffer TileLightCountBuffer {
+    uint tileLightCounts[];
+};
+
+shared uint sMinDepthBits;
+shared uint sMaxDepthBits;
+shared uint sVisibleLightCount;
+shared uint sVisibleLightIndices[MAX_LIGHTS_PER_TILE];
+shared vec4 sFrustumPlanes[4];
+
+vec3 unprojectNdcToView(vec2 ndcXY, float ndcZ) {
+    vec4 clipPos = vec4(ndcXY, ndcZ, 1.0);
+    vec4 viewPos = uCull.invProjectionMatrix * clipPos;
+    return viewPos.xyz / viewPos.w;
+}
+
+void main() {
+    uint localIdx = gl_LocalInvocationIndex;
+    uvec2 tileCoord = gl_WorkGroupID.xy;
+    uvec2 pixelCoord = gl_GlobalInvocationID.xy;
+
+    if (tileCoord.x >= uCull.screenAndTiles.z || tileCoord.y >= uCull.screenAndTiles.w) {
+        return;
+    }
+
+    // 1. Initialize shared tile accumulators.
+    if (localIdx == 0u) {
+        sMinDepthBits = 0xFFFFFFFFu;
+        sMaxDepthBits = 0u;
+        sVisibleLightCount = 0u;
+    }
+    memoryBarrierShared();
+    barrier();
+
+    // 2. Compute per-tile min/max linear view-space depth via shared atomics.
+    if (pixelCoord.x < uCull.screenAndTiles.x && pixelCoord.y < uCull.screenAndTiles.y) {
+        float rawDepth = texelFetch(uDepthTexture, ivec2(pixelCoord), 0).r;
+        if (rawDepth < 1.0) {
+            vec2 ndcXY = ((vec2(pixelCoord) + vec2(0.5)) / vec2(uCull.screenAndTiles.xy)) * 2.0 - 1.0;
+            float ndcZ = rawDepth * 2.0 - 1.0;
+            vec3 viewPos = unprojectNdcToView(ndcXY, ndcZ);
+
+            // Right-handed OpenGL view space looks down -Z; clamp to >= 0 for monotonic uint bit order.
+            float linearDepth = max(-viewPos.z, 0.0);
+            uint depthBits = floatBitsToUint(linearDepth);
+
+            atomicMin(sMinDepthBits, depthBits);
+            atomicMax(sMaxDepthBits, depthBits);
+        }
+    }
+
+    // 3. Construct the 4 inward-pointing view-space side frustum planes for this 16x16 tile.
+    if (localIdx == 0u) {
+        vec2 invScreen = vec2(1.0) / vec2(max(uCull.screenAndTiles.xy, uvec2(1u)));
+        vec2 tileMinPx = vec2(tileCoord * TILE_SIZE);
+        vec2 tileMaxPx = min(vec2((tileCoord + uvec2(1u)) * TILE_SIZE), vec2(uCull.screenAndTiles.xy));
+
+        vec2 ndcMin = tileMinPx * invScreen * 2.0 - 1.0;
+        vec2 ndcMax = tileMaxPx * invScreen * 2.0 - 1.0;
+
+        vec3 v00 = unprojectNdcToView(vec2(ndcMin.x, ndcMin.y), -1.0);
+        vec3 v10 = unprojectNdcToView(vec2(ndcMax.x, ndcMin.y), -1.0);
+        vec3 v11 = unprojectNdcToView(vec2(ndcMax.x, ndcMax.y), -1.0);
+        vec3 v01 = unprojectNdcToView(vec2(ndcMin.x, ndcMax.y), -1.0);
+
+        // Planes pass through view-space origin (d = 0); cross order yields inward normals.
+        sFrustumPlanes[0] = vec4(normalize(cross(v00, v01)), 0.0); // Left
+        sFrustumPlanes[1] = vec4(normalize(cross(v01, v11)), 0.0); // Top
+        sFrustumPlanes[2] = vec4(normalize(cross(v11, v10)), 0.0); // Right
+        sFrustumPlanes[3] = vec4(normalize(cross(v10, v00)), 0.0); // Bottom
+    }
+    memoryBarrierShared();
+    barrier();
+
+    // 4. Parallel light-sphere vs. tile-frustum & depth-slab culling across 256 invocations.
+    uint lightCount = uCull.lightParams.x;
+    uint maxPerTile = min(uCull.lightParams.y, MAX_LIGHTS_PER_TILE);
+
+    bool tileHasGeometry = (sMinDepthBits <= sMaxDepthBits);
+    if (tileHasGeometry) {
+        float minDepth = uintBitsToFloat(sMinDepthBits);
+        float maxDepth = uintBitsToFloat(sMaxDepthBits);
+
+        for (uint i = localIdx; i < lightCount; i += WORKGROUP_THREADS) {
+            PointLight light = lights[i];
+            float radius = light.positionRadius.w;
+            if (radius <= 0.0) {
+                continue;
+            }
+
+            vec3 viewCenter = (uCull.viewMatrix * vec4(light.positionRadius.xyz, 1.0)).xyz;
+            float lightDepth = -viewCenter.z;
+
+            // Depth slab check along view forward (-Z).
+            if ((lightDepth + radius) < minDepth || (lightDepth - radius) > maxDepth) {
+                continue;
+            }
+
+            // Four tile frustum side-plane tests.
+            bool inside = true;
+            for (int p = 0; p < 4; ++p) {
+                if (dot(sFrustumPlanes[p].xyz, viewCenter) < -radius) {
+                    inside = false;
+                    break;
+                }
+            }
+
+            if (inside) {
+                uint slot = atomicAdd(sVisibleLightCount, 1u);
+                if (slot < maxPerTile) {
+                    sVisibleLightIndices[slot] = i;
+                }
+            }
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+
+    // 5. Coalesced write of per-tile visible light indices to global SSBO.
+    uint tileIndex  = tileCoord.y * uCull.screenAndTiles.z + tileCoord.x;
+    uint finalCount = min(sVisibleLightCount, maxPerTile);
+    uint baseOffset = tileIndex * maxPerTile;
+
+    for (uint j = localIdx; j < finalCount; j += WORKGROUP_THREADS) {
+        tileLightIndices[baseOffset + j] = sVisibleLightIndices[j];
+    }
+
+    if (localIdx == 0u) {
+        tileLightCounts[tileIndex] = finalCount;
+    }
+}

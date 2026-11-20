@@ -1,0 +1,78 @@
+#version 460 core
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct ObjectBounds {
+    vec4  aabbMin;  // xyz = world AABB min, w = bounding sphere radius
+    vec4  aabbMax;  // xyz = world AABB max, w = unused padding
+    uvec4 meta;     // x = drawCommandIndex, y = instanceDataIndex, z = materialId, w = flags (bit 0 = enabled)
+};
+
+// Matches OpenGL 4.6 DrawElementsIndirectCommand (20 bytes, tightly packed in std430)
+struct DrawElementsIndirectCommand {
+    uint count;
+    uint instanceCount;
+    uint firstIndex;
+    int  baseVertex;
+    uint baseInstance;
+};
+
+layout(std140, binding = 0) uniform CameraFrustumUBO {
+    vec4  planes[6];    // Normalized inward-pointing planes: dot(n, p) + d >= 0 is inside
+    uvec4 cullParams;   // x = objectCount, y = maxVisibleInstances, z = drawCommandCount, w = 0
+} uFrustum;
+
+layout(std430, binding = 0) readonly buffer ObjectBoundsBuffer {
+    ObjectBounds objects[];
+};
+
+layout(std430, binding = 1) buffer DrawCommandBuffer {
+    DrawElementsIndirectCommand commands[];
+};
+
+layout(std430, binding = 2) writeonly buffer VisibleInstanceBuffer {
+    uint visibleInstanceIds[];
+};
+
+// Exact positive-vertex (p-vertex) AABB vs. 6 frustum planes visibility test.
+bool isAabbVisible(vec3 bMin, vec3 bMax) {
+    for (int i = 0; i < 6; ++i) {
+        vec4 plane = uFrustum.planes[i];
+        // Choose the AABB corner furthest along the inward plane normal.
+        vec3 pVertex = mix(bMin, bMax, greaterThanEqual(plane.xyz, vec3(0.0)));
+        if (dot(plane.xyz, pVertex) + plane.w < 0.0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= uFrustum.cullParams.x) {
+        return;
+    }
+
+    ObjectBounds obj = objects[idx];
+
+    // Bit 0 in meta.w indicates whether the object is active/enabled.
+    if ((obj.meta.w & 1u) == 0u) {
+        return;
+    }
+
+    if (!isAabbVisible(obj.aabbMin.xyz, obj.aabbMax.xyz)) {
+        return;
+    }
+
+    uint cmdIdx = obj.meta.x;
+    if (cmdIdx >= uFrustum.cullParams.z) {
+        return;
+    }
+
+    uint localSlot = atomicAdd(commands[cmdIdx].instanceCount, 1u);
+    uint writeIndex = commands[cmdIdx].baseInstance + localSlot;
+
+    if (writeIndex < uFrustum.cullParams.y) {
+        visibleInstanceIds[writeIndex] = obj.meta.y;
+    }
+}

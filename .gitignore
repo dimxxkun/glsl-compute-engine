@@ -1,0 +1,25 @@
+# Build directories
+build/
+build-*/
+out/
+cmake-build-*/
+
+# Compiled binaries & SPIR-V outputs
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+*.exe
+*.spv
+
+# IDE & OS metadata
+.vscode/
+.idea/
+.vs/
+*.user
+*.suo
+.DS_Store
+Thumbs.db

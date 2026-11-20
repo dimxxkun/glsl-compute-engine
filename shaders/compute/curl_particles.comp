@@ -1,0 +1,231 @@
+#version 460 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct Particle {
+    vec4 positionAge;   // xyz = world position, w = normalized age in [0, 1]
+    vec4 velocityMass;  // xyz = velocity, w = mass (> 0)
+};
+
+layout(std430, binding = 0) buffer ParticleBuffer {
+    Particle particles[];
+};
+
+layout(std140, binding = 0) uniform CurlSimParams {
+    vec4  timeParams;       // x = dt, y = elapsedTime, z = noiseFrequency, w = curlStrength
+    vec4  attractorPosStr;  // xyz = attractor position, w = attractor strength
+    vec4  boundsAndDrag;    // xyz = bounding sphere center, w = bounding sphere radius
+    vec4  physicsParams;    // x = drag, y = maxSpeed, z = respawnRate, w = finiteDiffEpsilon
+    uvec4 counts;           // x = particleCount, y = frameSeed, z = 0, w = 0
+} uSim;
+
+// -----------------------------------------------------------------------------
+// 3D Simplex Noise (Ashima / Gustavson formulation)
+// -----------------------------------------------------------------------------
+vec4 permute(vec4 x) {
+    return mod(((x * 34.0) + 1.0) * x, 289.0);
+}
+
+vec4 taylorInvSqrt(vec4 r) {
+    return 1.79284291400159 - 0.85373472095314 * r;
+}
+
+float snoise3D(vec3 v) {
+    const vec2 C = vec2(1.0 / 6.0, 1.0 / 3.0);
+    const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+
+    vec3 i  = floor(v + dot(v, C.yyy));
+    vec3 x0 = v - i + dot(i, C.xxx);
+
+    vec3 g  = step(x0.yzx, x0.xyz);
+    vec3 l  = 1.0 - g;
+    vec3 i1 = min(g.xyz, l.zxy);
+    vec3 i2 = max(g.xyz, l.zxy);
+
+    vec3 x1 = x0 - i1 + C.xxx;
+    vec3 x2 = x0 - i2 + C.yyy;
+    vec3 x3 = x0 - D.yyy;
+
+    i = mod(i, 289.0);
+    vec4 p = permute(
+        permute(
+            permute(i.z + vec4(0.0, i1.z, i2.z, 1.0))
+            + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+        + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+
+    float n_ = 1.0 / 7.0;
+    vec3  ns = n_ * D.wyz - D.xzx;
+
+    vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+
+    vec4 x_ = floor(j * ns.z);
+    vec4 y_ = floor(j - 7.0 * x_);
+
+    vec4 x = x_ * ns.x + ns.yyyy;
+    vec4 y = y_ * ns.x + ns.yyyy;
+    vec4 h = 1.0 - abs(x) - abs(y);
+
+    vec4 b0 = vec4(x.xy, y.xy);
+    vec4 b1 = vec4(x.zw, y.zw);
+
+    vec4 s0 = floor(b0) * 2.0 + 1.0;
+    vec4 s1 = floor(b1) * 2.0 + 1.0;
+    vec4 sh = -step(h, vec4(0.0));
+
+    vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+    vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+
+    vec3 p0 = vec3(a0.xy, h.x);
+    vec3 p1 = vec3(a0.zw, h.y);
+    vec3 p2 = vec3(a1.xy, h.z);
+    vec3 p3 = vec3(a1.zw, h.w);
+
+    vec4 norm = taylorInvSqrt(vec4(dot(p0, p0), dot(p1, p1), dot(p2, p2), dot(p3, p3)));
+    p0 *= norm.x;
+    p1 *= norm.y;
+    p2 *= norm.z;
+    p3 *= norm.w;
+
+    vec4 m = max(0.6 - vec4(dot(x0, x0), dot(x1, x1), dot(x2, x2), dot(x3, x3)), 0.0);
+    m = m * m;
+    return 42.0 * dot(m * m, vec4(dot(p0, x0), dot(p1, x1), dot(p2, x2), dot(p3, x3)));
+}
+
+// Three decorrelated vector-potential channels for divergence-free curl advection.
+vec3 noisePotential(vec3 p, float timeOffset) {
+    vec3 drift = vec3(0.0, timeOffset * 0.23, timeOffset * 0.17);
+    float px = snoise3D(p + drift);
+    float py = snoise3D(p + vec3(31.416, -47.853, 12.793) + drift);
+    float pz = snoise3D(p + vec3(-93.127, 19.641, -61.337) + drift);
+    return vec3(px, py, pz);
+}
+
+// Central finite-difference curl: nabla x Psi
+vec3 curlNoise(vec3 p, float timeOffset, float eps) {
+    vec3 dx = vec3(eps, 0.0, 0.0);
+    vec3 dy = vec3(0.0, eps, 0.0);
+    vec3 dz = vec3(0.0, 0.0, eps);
+
+    vec3 pxPos = noisePotential(p + dx, timeOffset);
+    vec3 pxNeg = noisePotential(p - dx, timeOffset);
+    vec3 pyPos = noisePotential(p + dy, timeOffset);
+    vec3 pyNeg = noisePotential(p - dy, timeOffset);
+    vec3 pzPos = noisePotential(p + dz, timeOffset);
+    vec3 pzNeg = noisePotential(p - dz, timeOffset);
+
+    float invTwoEps = 0.5 / max(eps, 1e-4);
+
+    float dPsiZ_dy = (pyPos.z - pyNeg.z) * invTwoEps;
+    float dPsiY_dz = (pzPos.y - pzNeg.y) * invTwoEps;
+
+    float dPsiX_dz = (pzPos.x - pzNeg.x) * invTwoEps;
+    float dPsiZ_dx = (pxPos.z - pxNeg.z) * invTwoEps;
+
+    float dPsiY_dx = (pxPos.y - pxNeg.y) * invTwoEps;
+    float dPsiX_dy = (pyPos.x - pyNeg.x) * invTwoEps;
+
+    return vec3(
+        dPsiZ_dy - dPsiY_dz,
+        dPsiX_dz - dPsiZ_dx,
+        dPsiY_dx - dPsiX_dy
+    );
+}
+
+// Deterministic PCG-style hash for particle respawn inside the bounding volume.
+uint hashUint(uint x) {
+    x = ((x >> 16u) ^ x) * 0x45d9f3bu;
+    x = ((x >> 16u) ^ x) * 0x45d9f3bu;
+    x = (x >> 16u) ^ x;
+    return x;
+}
+
+float hashFloat(uint seed) {
+    return float(hashUint(seed)) * (1.0 / 4294967295.0);
+}
+
+vec3 randomSpherePoint(uint seed, float radius) {
+    float u = hashFloat(seed * 3u + 1u);
+    float v = hashFloat(seed * 3u + 2u);
+    float w = hashFloat(seed * 3u + 3u);
+
+    float theta = 6.28318530718 * u;
+    float cosPhi = 2.0 * v - 1.0;
+    float sinPhi = sqrt(max(0.0, 1.0 - cosPhi * cosPhi));
+    float r = radius * pow(max(w, 1e-5), 1.0 / 3.0);
+
+    return vec3(r * sinPhi * cos(theta), r * cosPhi, r * sinPhi * sin(theta));
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= uSim.counts.x) {
+        return;
+    }
+
+    Particle p = particles[idx];
+    vec3 pos = p.positionAge.xyz;
+    float age = p.positionAge.w;
+    vec3 vel = p.velocityMass.xyz;
+    float mass = max(p.velocityMass.w, 0.05);
+
+    float dt           = uSim.timeParams.x;
+    float elapsedTime  = uSim.timeParams.y;
+    float noiseFreq    = uSim.timeParams.z;
+    float curlStrength = uSim.timeParams.w;
+
+    vec3  attractorPos = uSim.attractorPosStr.xyz;
+    float attractorStr = uSim.attractorPosStr.w;
+
+    vec3  boundsCenter = uSim.boundsAndDrag.xyz;
+    float boundsRadius = max(uSim.boundsAndDrag.w, 0.1);
+
+    float drag        = max(uSim.physicsParams.x, 0.0);
+    float maxSpeed    = max(uSim.physicsParams.y, 0.1);
+    float respawnRate = max(uSim.physicsParams.z, 0.0);
+    float eps         = max(uSim.physicsParams.w, 1e-3);
+
+    // 1. Divergence-free curl noise turbulence force
+    vec3 curlForce = curlNoise(pos * noiseFreq, elapsedTime, eps) * curlStrength;
+
+    // 2. Softened point-attractor force
+    vec3 toAttractor = attractorPos - pos;
+    float distSq = dot(toAttractor, toAttractor) + 0.25;
+    float invDist = inversesqrt(distSq);
+    vec3 attractorForce = (toAttractor * invDist) * (attractorStr / distSq);
+
+    // 3. Semi-implicit Euler integration with exponential drag and speed clamping
+    vec3 accel = (curlForce + attractorForce) / mass;
+    vel += accel * dt;
+    vel *= exp(-drag * dt);
+
+    float speed = length(vel);
+    if (speed > maxSpeed) {
+        vel *= (maxSpeed / speed);
+    }
+
+    pos += vel * dt;
+
+    // 4. Bounding sphere constraint with elastic radial reflection
+    vec3 offset = pos - boundsCenter;
+    float distFromCenter = length(offset);
+    if (distFromCenter > boundsRadius) {
+        vec3 normal = offset / max(distFromCenter, 1e-5);
+        pos = boundsCenter + normal * boundsRadius;
+        float outwardSpeed = dot(vel, normal);
+        if (outwardSpeed > 0.0) {
+            vel -= 1.65 * outwardSpeed * normal;
+        }
+    }
+
+    // 5. Age lifecycle & deterministic respawn
+    age += respawnRate * dt;
+    if (age >= 1.0) {
+        uint respawnSeed = idx * 747796405u + uSim.counts.y * 2891336453u + 1u;
+        pos = boundsCenter + randomSpherePoint(respawnSeed, boundsRadius * 0.35);
+        vel = curlNoise(pos * noiseFreq, elapsedTime, eps) * (curlStrength * 0.25);
+        age = fract(age);
+    }
+
+    particles[idx].positionAge  = vec4(pos, age);
+    particles[idx].velocityMass = vec4(vel, mass);
+}
